@@ -4,10 +4,10 @@ provider "aws" {
   default_tags {
     tags = merge(
       {
-        Project     = "ObservaStack"
-        ManagedBy   = "Terraform"
-        Component   = "GitHubOIDC"
-        Repository  = "observastack"
+        Project    = "ObservaStack"
+        ManagedBy  = "Terraform"
+        Component  = "GitHubOIDC"
+        Repository = "observastack"
       },
       var.tags
     )
@@ -64,9 +64,9 @@ data "aws_iam_policy_document" "github_oidc_trust" {
 
 data "aws_iam_policy_document" "terraform_bootstrap" {
   statement {
-    sid       = "TerraformStateBucket"
-    effect    = "Allow"
-    actions   = [
+    sid    = "TerraformStateBucket"
+    effect = "Allow"
+    actions = [
       "s3:CreateBucket",
       "s3:ListAllMyBuckets",
       "s3:GetBucketLocation",

@@ -3,6 +3,16 @@ name: Terraform Backend Bootstrap
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: "Terraform operation"
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+        default: plan
+
       environment:
         description: "Environment whose backend path should be initialized"
         required: true
@@ -12,8 +22,15 @@ on:
           - staging
           - production
         default: dev
+
+      confirm_destroy:
+        description: 'Required only for destroy. Enter "DESTROY" to continue.'
+        required: false
+        type: string
+        default: ""
+
       force_reconcile:
-        description: "Re-apply bucket controls even if they already exist"
+        description: "Reserved for future bootstrap reconciliation controls"
         required: false
         type: boolean
         default: false
@@ -32,11 +49,95 @@ env:
   TERRAFORM_STATE_PREFIX: observastack
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
 
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+  TERRAFORM_VERSION: "1.14.6"
+
 jobs:
-  bootstrap:
-    name: Bootstrap Terraform S3 backend
+  validate:
+    name: Validate Bootstrap Configuration
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
+
+    outputs:
+      operation: ${{ steps.config.outputs.operation }}
+      environment: ${{ steps.config.outputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Validate workflow configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : "${AWS_REGION:?Repository variable AWS_REGION is required}"
+          : "${TERRAFORM_STATE_BUCKET:?Repository variable TERRAFORM_STATE_BUCKET is required}"
+          : "${AWS_ACCOUNT_ID:?Repository variable AWS_ACCOUNT_ID is required}"
+
+          operation="${{ inputs.operation }}"
+          environment="${{ inputs.environment }}"
+          confirm_destroy="${{ inputs.confirm_destroy }}"
+
+          echo "Operation: ${operation}"
+          echo "Environment: ${environment}"
+          echo "AWS Region: ${AWS_REGION}"
+          echo "State Bucket: ${TERRAFORM_STATE_BUCKET}"
+
+          if [[ ! "${TERRAFORM_STATE_BUCKET}" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
+            echo "::error::Invalid S3 bucket name: ${TERRAFORM_STATE_BUCKET}"
+            exit 1
+          fi
+
+          if [[ "${operation}" == "destroy" ]]; then
+            if [[ "${confirm_destroy}" != "DESTROY" ]]; then
+              echo "::error::Destroy requested but confirm_destroy is not exactly DESTROY."
+              echo "::error::Enter DESTROY explicitly to authorize backend destruction."
+              exit 1
+            fi
+
+            echo "::warning::Terraform backend destruction has been explicitly requested."
+          fi
+
+          if [[ ! -d "terraform/global/backend" ]]; then
+            echo "::error::terraform/global/backend does not exist."
+            exit 1
+          fi
+
+          if [[ ! -f "terraform/global/backend/main.tf" ]]; then
+            echo "::error::terraform/global/backend/main.tf does not exist."
+            exit 1
+          fi
+
+          if [[ ! -f "terraform/global/backend/versions.tf" ]]; then
+            echo "::error::terraform/global/backend/versions.tf does not exist."
+            exit 1
+          fi
+
+          echo "operation=${operation}" >> "$GITHUB_OUTPUT"
+          echo "environment=${environment}" >> "$GITHUB_OUTPUT"
+
+      - name: Display Terraform bootstrap structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Terraform global backend module:"
+          find terraform/global/backend \
+            -maxdepth 2 \
+            -type f \
+            -print \
+            | sort
+
+  plan:
+    name: Terraform ${{ inputs.operation }}
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
     permissions:
       contents: read
       id-token: write
@@ -45,18 +146,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.2
 
-      - name: Validate bootstrap configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          : "${AWS_REGION:?Repository variable AWS_REGION is required}"
-          : "${TERRAFORM_STATE_BUCKET:?Repository variable TERRAFORM_STATE_BUCKET is required}"
-
-          if [[ ! "${TERRAFORM_STATE_BUCKET}" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
-            echo "Invalid S3 bucket name: ${TERRAFORM_STATE_BUCKET}"
-            exit 1
-          fi
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v6.2.3
@@ -67,107 +161,247 @@ jobs:
           allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
 
       - name: Verify AWS identity
-        run: aws sts get-caller-identity
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
 
-      - name: Bootstrap S3 state bucket
-        shell: bash
+      - name: Terraform version
+        working-directory: terraform/global/backend
+        run: terraform version
+
+      - name: Terraform format check
+        working-directory: terraform/global/backend
+        run: |
+          terraform fmt \
+            -check \
+            -recursive \
+            -no-color
+
+      - name: Terraform init
+        working-directory: terraform/global/backend
+        run: |
+          terraform init \
+            -input=false \
+            -no-color
+
+      - name: Terraform validate
+        working-directory: terraform/global/backend
+        run: |
+          terraform validate \
+            -no-color
+
+      - name: Terraform plan
+        id: terraform-plan
+        working-directory: terraform/global/backend
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_bucket_name: ${{ env.TERRAFORM_STATE_BUCKET }}
         run: |
           set -euo pipefail
 
-          bucket="${TERRAFORM_STATE_BUCKET}"
-          region="${AWS_REGION}"
+          operation="${{ inputs.operation }}"
 
-          if aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
-            echo "State bucket already exists: $bucket"
+          if [[ "${operation}" == "destroy" ]]; then
+            echo "::warning::Generating a DESTROY plan for the Terraform backend."
+
+            terraform plan \
+              -destroy \
+              -out=tfplan \
+              -input=false \
+              -no-color
+
           else
-            echo "Creating state bucket: $bucket"
-            if [[ "$region" == "us-east-1" ]]; then
-              aws s3api create-bucket --bucket "$bucket" --region "$region"
-            else
-              aws s3api create-bucket \
-                --bucket "$bucket" \
-                --region "$region" \
-                --create-bucket-configuration LocationConstraint="$region"
-            fi
+            terraform plan \
+              -out=tfplan \
+              -input=false \
+              -no-color
           fi
 
-      - name: Enable bucket versioning
+      - name: Show Terraform plan
+        working-directory: terraform/global/backend
         run: |
-          aws s3api put-bucket-versioning \
-            --bucket "${TERRAFORM_STATE_BUCKET}" \
-            --versioning-configuration Status=Enabled
+          terraform show \
+            -no-color \
+            tfplan
 
-      - name: Block public access
-        run: |
-          aws s3api put-public-access-block \
-            --bucket "${TERRAFORM_STATE_BUCKET}" \
-            --public-access-block-configuration \
-              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+      - name: Save Terraform plan
+        uses: actions/upload-artifact@v5
+        with:
+          name: terraform-bootstrap-plan-${{ github.run_id }}
+          path: terraform/global/backend/tfplan
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Enforce bucket ownership
-        run: |
-          aws s3api put-bucket-ownership-controls \
-            --bucket "${TERRAFORM_STATE_BUCKET}" \
-            --ownership-controls 'Rules=[{ObjectOwnership=BucketOwnerEnforced}]'
-
-      - name: Enable default encryption
-        run: |
-          aws s3api put-bucket-encryption \
-            --bucket "${TERRAFORM_STATE_BUCKET}" \
-            --server-side-encryption-configuration '{
-              "Rules": [{
-                "ApplyServerSideEncryptionByDefault": {
-                  "SSEAlgorithm": "AES256"
-                },
-                "BucketKeyEnabled": true
-              }]
-            }'
-
-      - name: Deny insecure transport
+      - name: Save Terraform plan summary
+        working-directory: terraform/global/backend
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > /tmp/bucket-policy.json <<EOF
-          {
-            "Version": "2012-10-17",
-            "Statement": [
-              {
-                "Sid": "DenyInsecureTransport",
-                "Effect": "Deny",
-                "Principal": "*",
-                "Action": "s3:*",
-                "Resource": [
-                  "arn:aws:s3:::${TERRAFORM_STATE_BUCKET}",
-                  "arn:aws:s3:::${TERRAFORM_STATE_BUCKET}/*"
-                ],
-                "Condition": {
-                  "Bool": {
-                    "aws:SecureTransport": "false"
-                  }
-                }
-              }
-            ]
-          }
-          EOF
+          terraform show \
+            -no-color \
+            tfplan \
+            > "${GITHUB_WORKSPACE}/terraform-bootstrap-plan.txt"
 
-          aws s3api put-bucket-policy \
-            --bucket "${TERRAFORM_STATE_BUCKET}" \
-            --policy file:///tmp/bucket-policy.json
+      - name: Upload Terraform plan summary
+        uses: actions/upload-artifact@v5
+        with:
+          name: terraform-bootstrap-plan-summary-${{ github.run_id }}
+          path: terraform-bootstrap-plan.txt
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Verify backend
+  apply:
+    name: Terraform Apply
+    needs:
+      - validate
+      - plan
+    if: inputs.operation == 'apply'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_BOOTSTRAP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-bootstrap-apply-${{ github.run_id }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+
+      - name: Verify AWS identity
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+
+      - name: Terraform init
+        working-directory: terraform/global/backend
+        run: |
+          terraform init \
+            -input=false \
+            -no-color
+
+      - name: Download approved Terraform plan
+        uses: actions/download-artifact@v6
+        with:
+          name: terraform-bootstrap-plan-${{ github.run_id }}
+          path: terraform/global/backend
+
+      - name: Verify Terraform plan file
+        working-directory: terraform/global/backend
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "tfplan" ]]; then
+            echo "::error::Terraform plan file tfplan was not found."
+            exit 1
+          fi
+
+          ls -lh tfplan
+
+      - name: Terraform apply
+        working-directory: terraform/global/backend
+        run: |
+          terraform apply \
+            -input=false \
+            -no-color \
+            tfplan
+
+  destroy:
+    name: Terraform Destroy
+    needs:
+      - validate
+      - plan
+    if: inputs.operation == 'destroy'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_BOOTSTRAP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-bootstrap-destroy-${{ github.run_id }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+
+      - name: Verify AWS identity
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+
+      - name: Terraform init
+        working-directory: terraform/global/backend
+        run: |
+          terraform init \
+            -input=false \
+            -no-color
+
+      - name: Download approved destroy plan
+        uses: actions/download-artifact@v6
+        with:
+          name: terraform-bootstrap-plan-${{ github.run_id }}
+          path: terraform/global/backend
+
+      - name: Verify Terraform destroy plan
+        working-directory: terraform/global/backend
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "tfplan" ]]; then
+            echo "::error::Terraform destroy plan file tfplan was not found."
+            exit 1
+          fi
+
+          echo "::warning::Terraform backend destruction is authorized."
+          echo "::warning::Confirmation value: DESTROY"
+          ls -lh tfplan
+
+      - name: Terraform destroy
+        working-directory: terraform/global/backend
+        run: |
+          terraform apply \
+            -input=false \
+            -no-color \
+            tfplan
+
+      - name: Destroy verification
         shell: bash
         run: |
           set -euo pipefail
 
-          aws s3api get-bucket-versioning \
-            --bucket "${TERRAFORM_STATE_BUCKET}"
+          if aws s3api head-bucket \
+            --bucket "${TERRAFORM_STATE_BUCKET}" \
+            >/dev/null 2>&1; then
 
-          aws s3api get-public-access-block \
-            --bucket "${TERRAFORM_STATE_BUCKET}"
+            echo "::error::Terraform backend bucket still exists after destroy."
+            exit 1
+          fi
 
-          aws s3api get-bucket-encryption \
-            --bucket "${TERRAFORM_STATE_BUCKET}"
-
-          echo "Terraform backend bucket is ready."
-          echo "State prefix: ${TERRAFORM_STATE_PREFIX}/"
+          echo "Terraform backend bucket has been destroyed."
